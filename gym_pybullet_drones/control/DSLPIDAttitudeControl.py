@@ -6,7 +6,7 @@ from scipy.spatial.transform import Rotation
 from gym_pybullet_drones.control.BaseControl import BaseControl
 from gym_pybullet_drones.utils.enums import DroneModel
 
-class DSLPIDControl(BaseControl):
+class DSLPIDAttitudeControl(BaseControl):
     """PID control class for Crazyflies.
 
     Based on work conducted at UTIAS' DSL. Contributors: SiQi Zhou, James Xu, 
@@ -81,14 +81,9 @@ class DSLPIDControl(BaseControl):
     
     def computeControl(self,
                        control_timestep,
-                       cur_pos,
                        cur_quat,
-                       cur_vel,
-                       cur_ang_vel,
-                       target_pos,
-                       target_rpy=np.zeros(3),
-                       target_vel=np.zeros(3),
-                       target_rpy_rates=np.zeros(3)
+                       target_thrust=0.,
+                       target_rpy=np.zeros(3)
                        ):
         """Computes the PID control action (as RPMs) for a single drone.
 
@@ -99,50 +94,27 @@ class DSLPIDControl(BaseControl):
         ----------
         control_timestep : float
             The time step at which control is computed.
-        cur_pos : ndarray
-            (3,1)-shaped array of floats containing the current position.
         cur_quat : ndarray
             (4,1)-shaped array of floats containing the current orientation as a quaternion.
-        cur_vel : ndarray
-            (3,1)-shaped array of floats containing the current velocity.
-        cur_ang_vel : ndarray
-            (3,1)-shaped array of floats containing the current angular velocity.
-        target_pos : ndarray
-            (3,1)-shaped array of floats containing the desired position.
         target_rpy : ndarray, optional
             (3,1)-shaped array of floats containing the desired orientation as roll, pitch, yaw.
-        target_vel : ndarray, optional
-            (3,1)-shaped array of floats containing the desired velocity.
-        target_rpy_rates : ndarray, optional
-            (3,1)-shaped array of floats containing the desired roll, pitch, and yaw rates.
 
         Returns
         -------
         ndarray
             (4,1)-shaped array of integers containing the RPMs to apply to each of the 4 motors.
-        ndarray
-            (3,1)-shaped array of floats containing the current XYZ position error.
         float
             The current yaw error.
 
         """
         self.control_counter += 1
-        thrust, computed_target_rpy, pos_e = self._dslPIDPositionControl(control_timestep,
-                                                                         cur_pos,
-                                                                         cur_quat,
-                                                                         cur_vel,
-                                                                         target_pos,
-                                                                         target_rpy,
-                                                                         target_vel
-                                                                         )
         rpm = self._dslPIDAttitudeControl(control_timestep,
-                                          thrust,
                                           cur_quat,
-                                          computed_target_rpy,
-                                          target_rpy_rates
+                                          target_thrust,
+                                          target_rpy
                                           )
         cur_rpy = p.getEulerFromQuaternion(cur_quat)
-        return rpm, pos_e, computed_target_rpy[2] - cur_rpy[2]
+        return rpm, computed_target_rpy[2] - cur_rpy[2]
     
     ################################################################################
 
@@ -194,7 +166,8 @@ class DSLPIDControl(BaseControl):
         target_thrust = np.multiply(self.P_COEFF_FOR, pos_e) \
                         + np.multiply(self.I_COEFF_FOR, self.integral_pos_e) \
                         + np.multiply(self.D_COEFF_FOR, vel_e) + np.array([0, 0, self.GRAVITY])
-        thrust = max(0., np.dot(target_thrust, cur_rotation[:,2]))
+        scalar_thrust = max(0., np.dot(target_thrust, cur_rotation[:,2]))
+        thrust = (math.sqrt(scalar_thrust / (4*self.KF)) - self.PWM2RPM_CONST) / self.PWM2RPM_SCALE
         target_z_ax = target_thrust / np.linalg.norm(target_thrust)
         target_x_c = np.array([math.cos(target_rpy[2]), math.sin(target_rpy[2]), 0])
         target_y_ax = np.cross(target_z_ax, target_x_c) / np.linalg.norm(np.cross(target_z_ax, target_x_c))
@@ -210,10 +183,9 @@ class DSLPIDControl(BaseControl):
 
     def _dslPIDAttitudeControl(self,
                                control_timestep,
-                               thrust,
                                cur_quat,
-                               target_euler,
-                               target_rpy_rates
+                               target_thrust,
+                               target_euler
                                ):
         """DSL's CF2.x PID attitude control.
 
@@ -243,7 +215,7 @@ class DSLPIDControl(BaseControl):
         target_rotation = (Rotation.from_quat([w, x, y, z])).as_matrix()
         rot_matrix_e = np.dot((target_rotation.transpose()),cur_rotation) - np.dot(cur_rotation.transpose(),target_rotation)
         rot_e = np.array([rot_matrix_e[2, 1], rot_matrix_e[0, 2], rot_matrix_e[1, 0]]) 
-        rpy_rates_e = target_rpy_rates - (cur_rpy - self.last_rpy)/control_timestep
+        rpy_rates_e = -(cur_rpy - self.last_rpy)/control_timestep
         self.last_rpy = cur_rpy
         self.integral_rpy_e = self.integral_rpy_e - rot_e*control_timestep
         self.integral_rpy_e = np.clip(self.integral_rpy_e, -1500., 1500.)
@@ -253,8 +225,7 @@ class DSLPIDControl(BaseControl):
                          + np.multiply(self.D_COEFF_TOR, rpy_rates_e) \
                          + np.multiply(self.I_COEFF_TOR, self.integral_rpy_e)
         target_torques = np.clip(target_torques, -3200, 3200)
-        thrust_pwm = (math.sqrt(thrust / (4*self.KF)) - self.PWM2RPM_CONST) / self.PWM2RPM_SCALE
-        pwm = thrust_pwm + np.dot(self.MIXER_MATRIX, target_torques)
+        pwm = target_thrust + np.dot(self.MIXER_MATRIX, target_torques)
         pwm = np.clip(pwm, self.MIN_PWM, self.MAX_PWM)
         return self.PWM2RPM_SCALE * pwm + self.PWM2RPM_CONST
     
